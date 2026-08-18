@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Hermes Command Code bridge launcher (v0.3)
+# Detects systemd-managed bridge or starts one ad-hoc.
+set -euo pipefail
+
+host="${COMMANDCODE_PROXY_HOST:-127.0.0.1}"
+port="${COMMANDCODE_PROXY_PORT:-8788}"
+hermes_home="${HERMES_HOME:-$HOME/.hermes}"
+bridge="$hermes_home/commandcode_bridge.py"
+pidfile="$hermes_home/commandcode_bridge.pid"
+logfile="${HERMES_COMMANDCODE_PROXY_LOG:-$hermes_home/commandcode_bridge.log}"
+python_bin="${PYTHON:-python3}"
+health_url="http://$host:$port/health"
+
+is_ready() {
+  curl -fsS "$health_url" >/dev/null 2>&1
+}
+
+# ── Auto-detect API key from auth files if not already set ──
+if [ -z "${COMMANDCODE_API_KEY:-}" ]; then
+  detected_key=$("$python_bin" - "$hermes_home" << 'PYEOF' 2>/dev/null || true
+import json, sys
+from pathlib import Path
+hermes_home = Path(sys.argv[1])
+for path in [
+    hermes_home / ".commandcode" / "auth.json",
+    Path.home() / ".commandcode" / "auth.json",
+    Path.home() / ".pi" / "agent" / "auth.json",
+]:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        continue
+    direct = data.get("apiKey") or data.get("commandcode")
+    if isinstance(direct, str) and direct:
+        print(direct)
+        break
+    cc = data.get("commandcode")
+    if isinstance(cc, dict):
+        access = cc.get("access")
+        if isinstance(access, str) and access:
+            print(access)
+            break
+PYEOF
+)
+  if [ -n "$detected_key" ]; then
+    export COMMANDCODE_API_KEY="$detected_key"
+  fi
+fi
+
+# ── Auto-configure: add commandcode provider to config.yaml if missing ──
+"$python_bin" - "$hermes_home" << 'PYEOF' 2>/dev/null || true
+import json, os, sys
+from pathlib import Path
+
+hermes_home = Path(sys.argv[1])
+config_path = hermes_home / "config.yaml"
+if not config_path.exists():
+    sys.exit(0)
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+
+with config_path.open(encoding="utf-8") as fh:
+    config = yaml.safe_load(fh) or {}
+if not isinstance(config, dict):
+    config = {}
+
+providers = config.setdefault("providers", {})
+if "commandcode" in providers:
+    sys.exit(0)
+
+models_dict = {}
+models_path = hermes_home / "models.json"
+if models_path.exists():
+    try:
+        parsed = json.loads(models_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, list):
+            models_dict = {
+                m["id"]: {"context_length": m["context_length"]}
+                for m in parsed if isinstance(m, dict) and "id" in m
+            }
+    except Exception:
+        pass
+
+providers["commandcode"] = {
+    "name": "Command Code",
+    "base_url": "http://127.0.0.1:8788/v1",
+    "key_env": "COMMANDCODE_API_KEY",
+    "transport": "chat_completions",
+    "model": "deepseek/deepseek-v4-flash",
+    "default_model": "deepseek/deepseek-v4-flash",
+    "models": models_dict,
+}
+with config_path.open("w", encoding="utf-8") as fh:
+    yaml.safe_dump(config, fh, sort_keys=False, allow_unicode=True)
+print("  ✓ Auto-configured commandcode provider in config.yaml")
+PYEOF
+
+# ── Ensure bridge is running ──
+# Priority: systemd service > nohup fallback > start nohup
+if is_ready; then
+  : # bridge already healthy (likely systemd-managed)
+elif systemctl --user is-active hermes-commandcode-bridge.service >/dev/null 2>&1; then
+  # systemd service exists but not healthy yet — wait for it
+  echo "  Waiting for systemd bridge service..." >&2
+  for _ in $(seq 1 20); do
+    is_ready && break
+    sleep 0.3
+  done
+else
+  # No systemd service — start bridge ad-hoc via nohup
+  if [ -f "$pidfile" ] && ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    rm -f "$pidfile"
+  fi
+  if [ ! -f "$pidfile" ]; then
+    COMMANDCODE_API_KEY="${COMMANDCODE_API_KEY:-}" \
+    nohup "$python_bin" "$bridge" --host "$host" --port "$port" >>"$logfile" 2>&1 &
+    echo "$!" >"$pidfile"
+  fi
+  for _ in $(seq 1 15); do
+    is_ready && break
+    sleep 0.2
+  done
+fi
+
+if ! is_ready; then
+  echo "Command Code bridge not responding. Check:" >&2
+  echo "  systemctl --user status hermes-commandcode-bridge.service" >&2
+  echo "  or: $logfile" >&2
+  exit 1
+fi
+
+# ── Inject --provider commandcode if not already specified ──
+inject_provider=1
+for arg in "$@"; do
+  if [ "$arg" = "--provider" ] || [ "$arg" = "-P" ]; then
+    inject_provider=0
+    break
+  fi
+done
+
+# Resolve hermes binary
+hermes_bin="${HERMES_BIN:-}"
+if [ -z "$hermes_bin" ]; then
+  hermes_bin="$(command -v hermes 2>/dev/null)" || true
+  if [ -z "$hermes_bin" ]; then
+    for candidate in "$hermes_home/.local/bin/hermes" "$HOME/.local/bin/hermes" "/usr/local/bin/hermes"; do
+      if [ -x "$candidate" ]; then
+        hermes_bin="$candidate"
+        break
+      fi
+    done
+  fi
+fi
+if [ -z "$hermes_bin" ] || [ ! -x "$hermes_bin" ]; then
+  echo "Could not find hermes binary. Set HERMES_BIN or ensure hermes is on PATH." >&2
+  exit 1
+fi
+
+if [ "$inject_provider" = 1 ]; then
+  set -- --provider commandcode "$@"
+fi
+
+exec "$hermes_bin" "$@"

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Hermes Command Code bridge standalone launcher (start bridge only)
+set -euo pipefail
+
+host="${COMMANDCODE_PROXY_HOST:-127.0.0.1}"
+port="${COMMANDCODE_PROXY_PORT:-8788}"
+hermes_home="${HERMES_HOME:-$HOME/.hermes}"
+bridge="$hermes_home/commandcode_bridge.py"
+python_bin="${PYTHON:-python3}"
+
+exec "$python_bin" "$bridge" --host "$host" --port "$port" "$@"

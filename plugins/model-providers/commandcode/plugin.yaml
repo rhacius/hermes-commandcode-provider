@@ -1,0 +1,5 @@
+name: commandcode-provider
+kind: model-provider
+version: 0.2.0
+description: Command Code Go subscription via local OpenAI-compatible bridge (no curl, no patches)
+author: hermes-agent

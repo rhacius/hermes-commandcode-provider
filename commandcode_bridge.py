@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+"""OpenAI-compatible local bridge for Command Code's alpha/generate endpoint.
+
+Improvements over MitoroMisaka/hermes-commandcode-provider:
+- Pure Python (no curl subprocess, no tempfiles) — uses http.client stdlib
+- Sampling params (temperature, top_p, stop) passed through to the model
+- response_format (JSON mode / JSON schema) passed through
+- Persistent session-id per bridge instance (same as CLI behavior)
+- Dynamic headers (no hardcoded version — configurable via env)
+- No hardcoded project slug
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import platform
+import sys
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Iterator
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+API_BASE = os.environ.get("COMMANDCODE_API_BASE", "https://api.commandcode.ai").rstrip("/")
+# Parse scheme + host from API_BASE
+if "://" in API_BASE:
+    _scheme, _rest = API_BASE.split("://", 1)
+    API_SCHEME = _scheme
+    API_HOST = _rest.split("/")[0]
+else:
+    API_SCHEME = "https"
+    API_HOST = API_BASE
+
+API_PATH_PREFIX = API_BASE.split(API_HOST, 1)[1] if API_HOST in API_BASE else ""
+CC_VERSION = os.environ.get("COMMANDCODE_VERSION", "0.24.1")
+CC_PROJECT_SLUG = os.environ.get("COMMANDCODE_PROJECT_SLUG", "hermes-agent")
+CC_ENVIRONMENT = os.environ.get("COMMANDCODE_ENVIRONMENT", "production")
+
+# Persistent session ID (lifetime of bridge process, like the CLI)
+SESSION_ID = str(uuid.uuid4())
+
+# Model catalog — loaded from models.json (single source of truth)
+_MODELS_CATALOG: list[dict[str, Any]] = []
+try:
+    _catalog_path = Path(__file__).resolve().parent / "models.json"
+    if _catalog_path.exists():
+        raw = _catalog_path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            _MODELS_CATALOG = parsed
+except Exception:
+    pass
+
+DEFAULT_MODELS: list[dict[str, Any]] = _MODELS_CATALOG or [
+{"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "context_length": 1000000},
+    {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "context_length": 1000000},
+    {"id": "claude-fable-5", "name": "Claude Fable 5", "context_length": 1000000},
+    {"id": "claude-opus-5", "name": "Claude Opus 5", "context_length": 1000000},
+    {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "context_length": 1000000},
+    {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "context_length": 1000000},
+    {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "context_length": 200000},
+    {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "context_length": 1050000},
+    {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra", "context_length": 1050000},
+    {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "context_length": 1050000},
+    {"id": "gpt-5.5", "name": "GPT-5.5", "context_length": 200000},
+    {"id": "gpt-5.4", "name": "GPT-5.4", "context_length": 400000},
+    {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "context_length": 400000},
+    {"id": "gpt-5.4-mini", "name": "GPT-5.4 Mini", "context_length": 400000},
+    {"id": "moonshotai/Kimi-K3", "name": "Kimi K3", "context_length": 1000000},
+    {"id": "moonshotai/Kimi-K2.7-Code", "name": "Kimi K2.7 Code", "context_length": 256000},
+    {"id": "moonshotai/Kimi-K2.7-Code-Highspeed", "name": "Kimi K2.7 Code HighSpeed", "context_length": 262000},
+    {"id": "moonshotai/Kimi-K2.6", "name": "Kimi K2.6", "context_length": 256000},
+    {"id": "moonshotai/Kimi-K2.5", "name": "Kimi K2.5", "context_length": 256000},
+    {"id": "zai-org/GLM-5.2", "name": "GLM-5.2", "context_length": 1000000},
+    {"id": "zai-org/GLM-5.2-Fast", "name": "GLM-5.2 Fast", "context_length": 1000000},
+    {"id": "zai-org/GLM-5.1", "name": "GLM-5.1", "context_length": 200000},
+    {"id": "zai-org/GLM-5", "name": "GLM-5", "context_length": 200000},
+    {"id": "MiniMaxAI/MiniMax-M3", "name": "MiniMax M3", "context_length": 1000000},
+    {"id": "MiniMaxAI/MiniMax-M2.7", "name": "MiniMax M2.7", "context_length": 200000},
+    {"id": "MiniMaxAI/MiniMax-M2.5", "name": "MiniMax M2.5", "context_length": 200000},
+    {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek V4 Pro", "context_length": 1000000},
+    {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash (latest)", "context_length": 1000000},
+    {"id": "Qwen/Qwen3.8-Max", "name": "Qwen 3.8 Max", "context_length": 1000000},
+    {"id": "Qwen/Qwen3.7-Max", "name": "Qwen 3.7 Max", "context_length": 1000000},
+    {"id": "Qwen/Qwen3.7-Plus", "name": "Qwen 3.7 Plus", "context_length": 1000000},
+    {"id": "Qwen/Qwen3.7-Flash", "name": "Qwen 3.7 Flash", "context_length": 1000000},
+    {"id": "Qwen/Qwen3.6-Max-Preview", "name": "Qwen 3.6 Max Preview", "context_length": 200000},
+    {"id": "Qwen/Qwen3.6-Plus", "name": "Qwen 3.6 Plus", "context_length": 200000},
+    {"id": "stepfun/Step-3.7-Flash", "name": "Step 3.7 Flash", "context_length": 256000},
+    {"id": "stepfun/Step-3.5-Flash", "name": "Step 3.5 Flash", "context_length": 1000000},
+    {"id": "tencent/hy3-paid", "name": "Tencent Hy3", "context_length": 262144},
+    {"id": "nvidia/nemotron-3-ultra-550b-a55b", "name": "Nemotron 3 Ultra", "context_length": 1000000},
+    {"id": "sakana/fugu-ultra", "name": "Fugu Ultra", "context_length": 1000000},
+    {"id": "google/gemini-3.6-flash", "name": "Gemini 3.6 Flash", "context_length": 1000000},
+    {"id": "google/gemini-3.5-flash", "name": "Gemini 3.5 Flash", "context_length": 1000000},
+    {"id": "google/gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite", "context_length": 1000000},
+    {"id": "google/gemini-3.1-flash-lite", "name": "Gemini 3.1 Flash Lite", "context_length": 1000000},
+    {"id": "xiaomi/mimo-v2.5-pro", "name": "MiMo V2.5 Pro", "context_length": 1000000},
+    {"id": "xiaomi/mimo-v2.5", "name": "MiMo V2.5", "context_length": 1000000},
+    {"id": "thinkingmachines/inkling", "name": "Inkling", "context_length": 256000},
+    {"id": "thinkingmachines/inkling-small", "name": "Inkling Small", "context_length": 1000000},
+    {"id": "poolside/laguna-s-2.1-free", "name": "Laguna S 2.1", "context_length": 256000},
+    {"id": "meta/muse-spark-1.1", "name": "Muse Spark 1.1", "context_length": 1048576},
+    {"id": "meta/muse-spark-1.2", "name": "Muse Spark 1.2", "context_length": 1048576},
+    {"id": "meta/muse-spark-1.2-contributor", "name": "Muse Spark 1.2 Contributor", "context_length": 1048576},
+    {"id": "xai/grok-4.5", "name": "Grok 4.5", "context_length": 500000}
+]
+DEFAULT_MAX_TOKENS = 32000
+
+# ── Auth ────────────────────────────────────────────────────────────────────
+
+def _auth_from_files() -> str:
+    """Read Command Code auth from known credential files."""
+    paths = [
+        Path.home() / ".commandcode" / "auth.json",
+        Path.home() / ".pi" / "agent" / "auth.json",
+    ]
+    for path in paths:
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        # Direct apiKey
+        direct = data.get("apiKey") or data.get("commandcode")
+        if isinstance(direct, str) and direct:
+            return direct
+        # Nested structure: {commandcode: {access: "..."}}
+        cc = data.get("commandcode")
+        if isinstance(cc, dict):
+            access = cc.get("access")
+            if isinstance(access, str) and access:
+                return access
+    return ""
+
+
+def _api_key(headers: Any) -> str:
+    """Resolve API key: Authorization header > env var > auth files."""
+    auth = headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        if token and token.lower() not in {"x", "none", "null", "dummy"}:
+            return token
+    return os.environ.get("COMMANDCODE_API_KEY", "") or _auth_from_files()
+
+
+# ── HTTP helpers (stdlib, no curl) ──────────────────────────────────────────
+
+_MAX_REQUEST_BODY = 10 * 1024 * 1024  # 10 MB limit
+
+
+def _new_connection() -> http.client.HTTPConnection:
+    """Create an HTTP(S) connection based on API_SCHEME."""
+    if API_SCHEME == "https":
+        return http.client.HTTPSConnection(API_HOST, timeout=60)
+    return http.client.HTTPConnection(API_HOST, timeout=60)
+
+
+def _cc_request(
+    method: str,
+    path: str,
+    api_key: str,
+    body: bytes | None = None,
+) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+    """Make a request and return (connection, response).
+
+    The caller MUST close the connection after consuming the response body.
+    For streaming, close after the last read. For non-streaming, close after
+    ``resp.read()``.
+    """
+    conn = _new_connection()
+    try:
+        headers = {
+            "Accept": "text/event-stream, application/x-ndjson, application/json",
+            "Authorization": f"Bearer {api_key}",
+            "x-command-code-version": CC_VERSION,
+            "x-cli-environment": CC_ENVIRONMENT,
+            "x-project-slug": CC_PROJECT_SLUG,
+            "x-taste-learning": "false",
+            "x-co-flag": "false",
+            "x-session-id": SESSION_ID,
+            "User-Agent": "hermes-commandcode-bridge/0.1",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        full_path = f"{API_PATH_PREFIX}{path}"
+        conn.request(method, full_path, body=body, headers=headers)
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            err_body = resp.read().decode("utf-8", errors="replace")[:1000]
+            conn.close()
+            raise RuntimeError(
+                f"Command Code API returned {resp.status} {resp.reason}: {err_body}"
+            )
+        return conn, resp
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"Command Code API request failed: {exc}") from exc
+
+
+def _sse_events(conn: http.client.HTTPConnection, resp: http.client.HTTPResponse) -> Iterator[dict[str, Any]]:
+    """Yield events from an HTTP SSE/NDJSON stream, then close connection.
+
+    Accepts both standard SSE (``data: {...}``) and raw NDJSON (``{...}``)
+    formats. Handles multi-line payloads by reassembling continuation lines.
+    """
+    buffer_line = ""
+    try:
+        while True:
+            raw = resp.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace")
+            stripped = line.strip()
+
+            if not stripped or stripped.startswith(":") or stripped.startswith("event:"):
+                continue
+
+            # Strip SSE data: prefix if present; otherwise treat as raw JSON
+            payload = stripped[5:].strip() if stripped.startswith("data:") else stripped
+
+            if not payload or payload == "[DONE]":
+                continue
+
+            # If we're already buffering a multi-line event...
+            if buffer_line and stripped.startswith("{"):
+                # Previous buffer was incomplete JSON — flush it first
+                event = _parse_sse_data(buffer_line)
+                buffer_line = ""
+                if event is not None:
+                    yield event
+
+            if buffer_line:
+                # Continuation line — append
+                buffer_line += stripped
+                if _is_complete_json(buffer_line):
+                    event = _parse_sse_data(buffer_line)
+                    buffer_line = ""
+                    if event is not None:
+                        yield event
+            elif _is_complete_json(payload):
+                event = _parse_sse_data(payload)
+                if event is not None:
+                    yield event
+            else:
+                # Incomplete JSON — start buffering
+                buffer_line = payload
+
+        # Flush remaining buffer
+        if buffer_line:
+            event = _parse_sse_data(buffer_line)
+            if event is not None:
+                yield event
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"SSE parse error: {exc}") from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _is_complete_json(s: str) -> bool:
+    """Check if a string looks like complete JSON (fast check)."""
+    s = s.strip()
+    if s.startswith("{"):
+        return s.endswith("}")
+    if s.startswith("["):
+        return s.endswith("]")
+    return True
+
+
+def _parse_sse_data(data: str) -> dict[str, Any] | None:
+    """Parse an SSE data line into a dict, or None if parseable but non-event.
+
+    Raises RuntimeError for upstream error events.
+    """
+    if not data or data == "[DONE]":
+        return None
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    err = event.get("error")
+    if event.get("success") is False or (err is not None and event.get("type") is None):
+        msg = (
+            err.get("message") if isinstance(err, dict) else str(err or event)
+        )
+        raise RuntimeError(msg)
+    return event
+
+
+# ── Models ──────────────────────────────────────────────────────────────────
+
+def _model_entry(model: dict[str, Any]) -> dict[str, Any]:
+    mid = str(model.get("id") or "").strip()
+    ctx = model.get("context_length")
+    try:
+        ctx = int(ctx) if ctx is not None else 0
+    except (ValueError, TypeError):
+        ctx = 0
+    entry: dict[str, Any] = {
+        "id": mid,
+        "object": "model",
+        "created": int(model.get("created") or time.time()),
+        "owned_by": model.get("owned_by") or "command-code",
+        "name": model.get("name") or mid,
+        "max_completion_tokens": DEFAULT_MAX_TOKENS,
+        "top_provider": {"max_completion_tokens": DEFAULT_MAX_TOKENS},
+    }
+    if ctx and ctx > 0:
+        entry["context_length"] = ctx
+        entry["max_context_length"] = ctx
+    return entry
+
+
+def _fallback_model_entries() -> list[dict[str, Any]]:
+    return [_model_entry(m) for m in DEFAULT_MODELS]
+
+
+def _fetch_commandcode_models(api_key: str) -> list[dict[str, Any]]:
+    """Fetch live model catalog from Command Code API."""
+    if not api_key:
+        return _fallback_model_entries()
+    conn = None
+    try:
+        conn, resp = _cc_request("GET", "/provider/v1/models", api_key)
+        raw = resp.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            return _fallback_model_entries()
+        entries = [
+            _model_entry(item)
+            for item in items
+            if isinstance(item, dict) and item.get("id")
+        ]
+        return entries or _fallback_model_entries()
+    except Exception:
+        return _fallback_model_entries()
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ── Message / tool translation ──────────────────────────────────────────────
+
+def _text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            if t in ("text", "input_text"):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def _parse_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _openai_messages_to_commandcode(
+    messages: list[Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Translate OpenAI message format to Command Code format."""
+    system_parts: list[str] = []
+    converted: list[dict[str, Any]] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+
+        if role in ("system", "developer"):
+            text = _text_from_content(content)
+            if text:
+                system_parts.append(text)
+            continue
+
+        if role == "user":
+            converted.append({"role": "user", "content": _text_from_content(content)})
+            continue
+
+        if role == "assistant":
+            parts: list[dict[str, Any]] = []
+            text = _text_from_content(content)
+            if text:
+                parts.append({"type": "text", "text": text})
+            reasoning = message.get("reasoning_content") or message.get("reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                parts.append({"type": "reasoning", "text": reasoning})
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                parts.append({
+                    "type": "tool-call",
+                    "toolCallId": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "toolName": fn.get("name") or call.get("name") or "",
+                    "input": _parse_arguments(fn.get("arguments") or call.get("arguments")),
+                })
+            if parts:
+                converted.append({"role": "assistant", "content": parts})
+            continue
+
+        if role == "tool":
+            tcid = message.get("tool_call_id") or message.get("toolCallId") or ""
+            tname = message.get("name") or message.get("tool_name") or ""
+            converted.append({
+                "role": "tool",
+                "content": [
+                    {
+                        "type": "tool-result",
+                        "toolCallId": tcid,
+                        "toolName": tname,
+                        "output": {"type": "text", "value": _text_from_content(content)},
+                    }
+                ],
+            })
+
+    return "\n\n".join(system_parts), converted
+
+
+def _openai_tools_to_commandcode(tools: Any) -> list[dict[str, Any]]:
+    """Translate OpenAI tool format to Command Code format."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return out
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        out.append({
+            "type": "function",
+            "name": name,
+            "description": fn.get("description") if isinstance(fn.get("description"), str) else "",
+            "input_schema": fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {},
+        })
+    return out
+
+
+# ── Payload building ────────────────────────────────────────────────────────
+
+def _build_alpha_payload(request: dict[str, Any]) -> dict[str, Any]:
+    """Build the Command Code /alpha/generate payload from an OpenAI request."""
+    system, messages = _openai_messages_to_commandcode(request.get("messages") or [])
+    max_tokens = request.get("max_tokens") or request.get("max_completion_tokens") or DEFAULT_MAX_TOKENS
+    try:
+        max_tokens = max(1, min(int(max_tokens), 200_000))
+    except (ValueError, TypeError):
+        max_tokens = DEFAULT_MAX_TOKENS
+
+    params: dict[str, Any] = {
+        "model": request.get("model") or DEFAULT_MODELS[0]["id"],
+        "messages": messages,
+        "tools": _openai_tools_to_commandcode(request.get("tools")),
+        "system": system,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    # ── Sampling params passthrough ──────────────────────────────────────────
+    for key in ("temperature", "top_p"):
+        val = request.get(key)
+        if val is not None:
+            try:
+                params[key] = float(val)
+            except (ValueError, TypeError):
+                pass
+
+    stop = request.get("stop")
+    if stop is not None:
+        params["stop"] = stop
+
+    # response_format passthrough (JSON mode, JSON schema)
+    rf = request.get("response_format")
+    if rf is not None and isinstance(rf, dict):
+        params["response_format"] = rf
+
+    return {
+        "config": {
+            "workingDir": os.getcwd(),
+            "date": time.strftime("%Y-%m-%d"),
+            "environment": f"{sys.platform}-{platform.machine()}, Python {platform.python_version()}",
+            "structure": [],
+            "isGitRepo": False,
+            "currentBranch": "",
+            "mainBranch": "",
+            "gitStatus": "",
+            "recentCommits": [],
+        },
+        "memory": "",
+        "taste": "",
+        "skills": None,
+        "permissionMode": "standard",
+        "params": params,
+    }
+
+
+# ── Response handling ───────────────────────────────────────────────────────
+
+def _map_finish_reason(reason: Any, has_tool_calls: bool = False) -> str:
+    if reason in ("tool-calls", "toolUse", "tool_calls") or has_tool_calls:
+        return "tool_calls"
+    if reason in ("length", "max_tokens", "max-tokens", "max_output_tokens"):
+        return "length"
+    return "stop"
+
+
+def _openai_usage(finish_event: dict[str, Any] | None) -> dict[str, Any]:
+    usage = finish_event.get("totalUsage") if isinstance(finish_event, dict) else None
+    if not isinstance(usage, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    input_tokens = int(usage.get("inputTokens") or 0)
+    completion = int(usage.get("outputTokens") or 0)
+    cache = usage.get("inputTokenDetails")
+    cache_read = 0
+    cache_write = 0
+    if isinstance(cache, dict):
+        cache_read = int(cache.get("cacheReadTokens") or 0)
+        cache_write = int(cache.get("cacheWriteTokens") or 0)
+    prompt = input_tokens + cache_read + cache_write
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": {
+            "cached_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+        },
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+    }
+
+
+def _iter_alpha_events(payload: dict[str, Any], api_key: str) -> Iterator[dict[str, Any]]:
+    """Stream SSE events from Command Code's /alpha/generate."""
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    conn, resp = _cc_request("POST", "/alpha/generate", api_key, body=body_bytes)
+    yield from _sse_events(conn, resp)
+
+
+def _sse(handler: BaseHTTPRequestHandler, payload: dict[str, Any], api_key: str) -> None:
+    """Stream a response as Server-Sent Events (OpenAI chat.completion.chunk format).
+
+    Errors after headers are committed are sent as SSE error chunks, not
+    as HTTP error responses.
+    """
+    model = payload["params"]["model"]
+    created = int(time.time())
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    events = _iter_alpha_events(payload, api_key)
+
+    # Commit headers first — once sent, errors become SSE error chunks
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Connection", "close")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+
+    def send(data: dict[str, Any]) -> None:
+        try:
+            handler.wfile.write(
+                f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+            )
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    try:
+        first_event: dict[str, Any] | None = None
+        try:
+            first_event = next(events)
+        except StopIteration:
+            pass
+
+        # Initial chunk with role
+        send({
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        })
+
+        finish_reason = "stop"
+        finish_event: dict[str, Any] | None = None
+        tool_index = 0
+        has_tool_calls = False
+
+        def handle_event(event: dict[str, Any]) -> None:
+            nonlocal finish_reason, finish_event, has_tool_calls, tool_index
+            et = event.get("type")
+
+            if et == "text-delta":
+                text = event.get("text")
+                if isinstance(text, str) and text:
+                    send({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                    })
+
+            elif et == "reasoning-delta":
+                text = event.get("text")
+                if isinstance(text, str) and text:
+                    send({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}],
+                    })
+
+            elif et == "tool-call":
+                has_tool_calls = True
+                args = event.get("input") or event.get("args") or event.get("arguments") or {}
+                send({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": tool_index,
+                                "id": event.get("toolCallId") or f"call_{uuid.uuid4().hex[:12]}",
+                                "type": "function",
+                                "function": {
+                                    "name": event.get("toolName") or "",
+                                    "arguments": json.dumps(args, ensure_ascii=False),
+                                },
+                            }]
+                        },
+                        "finish_reason": None,
+                    }],
+                })
+                tool_index += 1
+
+            elif et == "finish":
+                finish_event = event
+                finish_reason = _map_finish_reason(event.get("finishReason"), has_tool_calls)
+
+            elif et == "error":
+                msg = event.get("error")
+                if isinstance(msg, dict):
+                    msg = msg.get("message")
+                raise RuntimeError(str(msg or "Command Code stream error"))
+
+        if isinstance(first_event, dict):
+            handle_event(first_event)
+        for event in events:
+            handle_event(event)
+
+        # Final chunk with usage
+        send({
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "usage": _openai_usage(finish_event),
+        })
+        handler.wfile.write(b"data: [DONE]\n\n")
+        handler.wfile.flush()
+
+    except Exception as exc:
+        if os.environ.get("COMMANDCODE_PROXY_VERBOSE"):
+            print(f"  SSE stream error: {exc}", file=sys.stderr)
+        send({
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+        })
+        handler.wfile.write(b"data: [DONE]\n\n")
+        try:
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+
+def _non_stream(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """Collect a non-streaming response from streaming events."""
+    content: list[str] = []
+    reasoning_content: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    finish_event: dict[str, Any] | None = None
+
+    for event in _iter_alpha_events(payload, api_key):
+        et = event.get("type")
+        if et == "text-delta" and isinstance(event.get("text"), str):
+            content.append(event["text"])
+        elif et == "reasoning-delta" and isinstance(event.get("text"), str):
+            reasoning_content.append(event["text"])
+        elif et == "tool-call":
+            args = event.get("input") or event.get("args") or event.get("arguments") or {}
+            tool_calls.append({
+                "id": event.get("toolCallId") or f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {
+                    "name": event.get("toolName") or "",
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            })
+        elif et == "finish":
+            finish_event = event
+        elif et == "error":
+            msg = event.get("error")
+            if isinstance(msg, dict):
+                msg = msg.get("message")
+            raise RuntimeError(str(msg or "Command Code stream error"))
+
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
+    if reasoning_content:
+        message["reasoning_content"] = "".join(reasoning_content)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    finish_reason = _map_finish_reason(
+        finish_event.get("finishReason") if isinstance(finish_event, dict) else None,
+        bool(tool_calls),
+    )
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": payload["params"]["model"],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": _openai_usage(finish_event),
+    }
+
+
+# ── HTTP Handler ────────────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "CommandCodeBridge/0.2"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        if os.environ.get("COMMANDCODE_PROXY_VERBOSE"):
+            super().log_message(fmt, *args)
+
+    def _json(self, status: int, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "authorization, content-type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _error(self, status: int, message: str) -> None:
+        self._json(status, {
+            "error": {
+                "message": message,
+                "type": "commandcode_bridge_error",
+                "code": status,
+            }
+        })
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "authorization, content-type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path in ("", "/health"):
+            self._json(200, {"ok": True, "session_id": SESSION_ID})
+            return
+        if path in ("/models", "/v1/models"):
+            self._json(200, {
+                "object": "list",
+                "data": _fetch_commandcode_models(_api_key(self.headers)),
+            })
+            return
+        self._error(404, f"Unknown path: {path}")
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path not in ("/chat/completions", "/v1/chat/completions"):
+            self._error(404, f"Unknown path: {path}")
+            return
+
+        api_key = _api_key(self.headers)
+        if not api_key:
+            self._error(401, "Missing COMMANDCODE_API_KEY or ~/.commandcode/auth.json")
+            return
+
+        try:
+            length_str = self.headers.get("Content-Length", "0") or "0"
+            try:
+                length = int(length_str)
+            except (ValueError, TypeError):
+                self._error(400, f"Invalid Content-Length: {length_str!r}")
+                return
+            if length < 0:
+                self._error(400, f"Negative Content-Length: {length}")
+                return
+            if length > _MAX_REQUEST_BODY:
+                self._error(413, f"Request body too large ({length} bytes, max {_MAX_REQUEST_BODY})")
+                return
+            raw = self.rfile.read(length) if length else b"{}"
+            request = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(request, dict):
+                request = {}
+
+            payload = _build_alpha_payload(request)
+            if request.get("stream") is True:
+                _sse(self, payload, api_key)
+            else:
+                self._json(200, _non_stream(payload, api_key))
+        except Exception as exc:
+            self._error(502, str(exc))
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Command Code OpenAI-compatible bridge (no curl, no tempfiles)"
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("COMMANDCODE_PROXY_HOST", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("COMMANDCODE_PROXY_PORT", "8788")),
+    )
+    args = parser.parse_args()
+
+    # Safety: refuse non-loopback binding unless explicitly opted in
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        allow = os.environ.get("COMMANDCODE_PROXY_ALLOW_REMOTE")
+        if allow != "1":
+            print(
+                f"SECURITY: Refusing to bind to {args.host!r} (non-loopback).\n"
+                "Set COMMANDCODE_PROXY_ALLOW_REMOTE=1 to override — you are EXPOSING\n"
+                "your Command Code API key and credits to the network.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    # Actually enforce the timeout on accepted client sockets (serve_forever
+    # ignores BaseServer.timeout; we set it on each connected socket instead).
+    _orig_process_request = server.process_request
+
+    def _timed_process_request(request, client_address):
+        request.settimeout(30)
+        return _orig_process_request(request, client_address)
+
+    server.process_request = _timed_process_request
+    print(
+        f"Command Code bridge v0.2 listening on http://{args.host}:{args.port}/v1",
+        flush=True,
+    )
+    print(f"  Session: {SESSION_ID}", flush=True)
+    print(f"  API: {API_SCHEME}://{API_HOST}", flush=True)
+    print("  Sampling params: temperature/top_p/stop/response_format ✓", flush=True)
+    print("  Zero tempfiles, zero curl subprocesses ✓", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...", flush=True)
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

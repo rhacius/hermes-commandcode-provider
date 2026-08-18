@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Block commits that introduce secret-like literals.
+set -euo pipefail
+
+repo="$(git rev-parse --show-toplevel)"
+python3 "$repo/scripts/check_secrets.py" --staged
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --redact --no-banner
+fi

@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes Command Code Bridge (OpenAI-compatible proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.hermes/commandcode_bridge.py --host 127.0.0.1 --port 8788
+Restart=always
+RestartSec=3
+EnvironmentFile=%h/.hermes/.env
+Environment=COMMANDCODE_PROXY_VERBOSE=1
+
+[Install]
+WantedBy=default.target
